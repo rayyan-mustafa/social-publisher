@@ -1,26 +1,25 @@
 #!/usr/bin/env node
 /**
  * ==============================================================================
- * SOCIAL PUBLISHER — AUTONOMOUS MULTI-PLATFORM PUBLISHER CLI
+ * TILLERCAST — DIRECT MULTI-PLATFORM SOCIAL PUBLISHER (ZERO-COGS ARCHITECTURE)
  * ==============================================================================
- * Supported Channels:
- *   - Reddit Direct API (Self-posts, Link posts, Flairs to any Subreddit, 100 QPM)
- *   - X / Twitter API v2 (Single Tweets & Multi-Tweet Threads via twitter-api-v2)
- *   - LinkedIn REST API (Personal & Organization Feed Updates)
- *
- * Author: Rayyan Mustafa
- * License: MIT
+ * Supported Direct Channels:
+ *   - Reddit API (Self-posts & Links to any Subreddit, 100 QPM, $0 Free Tier)
+ *   - X / Twitter API v2 (Tweets & Threads via twitter-api-v2, 500 tweets/mo $0 Free Tier)
+ *   - LinkedIn REST API (Posts to Personal or Org Feeds, $0 Free Tier)
+ *   - Typefully (Fallback via installed Typefully Agent Skill)
  * ==============================================================================
  */
 
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
 // Load environment variables from .env
 try {
-  require('dotenv').config({ path: path.join(__dirname, '.env') });
+  require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 } catch {
-  const envPath = path.join(__dirname, '.env');
+  const envPath = path.join(__dirname, '..', '.env');
   if (fs.existsSync(envPath)) {
     const lines = fs.readFileSync(envPath, 'utf8').split('\n');
     for (const line of lines) {
@@ -67,7 +66,7 @@ async function publishToReddit({ subreddit, title, text, url, dryRun = false }) 
 
   // 1. Authenticate with Reddit OAuth
   const authHeader = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-  const userAgent = `SocialPublisher/1.0.0 (by /u/${username})`;
+  const userAgent = `TillercastPublisher/1.0.0 (by /u/${username})`;
 
   const tokenParams = new URLSearchParams({
     grant_type: 'password',
@@ -175,13 +174,7 @@ async function publishToTwitter({ text, dryRun = false }) {
     };
   }
 
-  let TwitterApi;
-  try {
-    TwitterApi = require('twitter-api-v2').TwitterApi;
-  } catch {
-    throw new Error('Package twitter-api-v2 not installed. Run: npm install');
-  }
-
+  const { TwitterApi } = require('twitter-api-v2');
   const client = new TwitterApi({
     appKey,
     appSecret,
@@ -215,7 +208,7 @@ async function publishToTwitter({ text, dryRun = false }) {
 // ------------------------------------------------------------------------------
 // LINKEDIN DIRECT PUBLISHER (REST Posts API)
 // ------------------------------------------------------------------------------
-async function publishToLinkedIn({ text, dryRun = false }) {
+async function publishToLinkedIn({ text, target = 'personal', dryRun = false }) {
   const accessToken = process.env.LINKEDIN_ACCESS_TOKEN;
   if (!accessToken) {
     throw new Error('Missing LINKEDIN_ACCESS_TOKEN in .env.');
@@ -223,71 +216,90 @@ async function publishToLinkedIn({ text, dryRun = false }) {
 
   if (!text) throw new Error('Text is required for LinkedIn post (--text <content>).');
 
-  let authorUrn = process.env.LINKEDIN_PERSON_URN;
+  const personUrn = process.env.LINKEDIN_PERSON_URN;
+  const orgUrn = process.env.LINKEDIN_ORGANIZATION_URN || 'urn:li:organization:145405594';
+
+  const targets = [];
+  if (target === 'both') {
+    if (personUrn) targets.push({ type: 'personal', urn: personUrn });
+    if (orgUrn) targets.push({ type: 'company', urn: orgUrn });
+  } else if (target === 'company') {
+    if (!orgUrn) throw new Error('Missing LINKEDIN_ORGANIZATION_URN in .env.');
+    targets.push({ type: 'company', urn: orgUrn });
+  } else {
+    // Default: personal
+    if (!personUrn) throw new Error('Missing LINKEDIN_PERSON_URN in .env.');
+    targets.push({ type: 'personal', urn: personUrn });
+  }
 
   if (dryRun) {
     return {
       platform: 'linkedin',
       status: 'DRY_RUN',
       textLength: text.length,
-      authorUrn: authorUrn || 'Will resolve via /v2/userinfo',
+      targets: targets.map((t) => `${t.type} (${t.urn})`),
     };
   }
 
-  if (!authorUrn) {
-    const userRes = await fetch('https://api.linkedin.com/v2/userinfo', {
-      headers: { Authorization: `Bearer ${accessToken}` },
+  const results = [];
+
+  for (const t of targets) {
+    const postBody = {
+      author: t.urn,
+      commentary: text,
+      visibility: 'PUBLIC',
+      distribution: {
+        feedDistribution: 'MAIN_FEED',
+        targetEntities: [],
+        thirdPartyDistributionChannels: [],
+      },
+      lifecycleState: 'PUBLISHED',
+    };
+
+    const postRes = await fetch('https://api.linkedin.com/rest/posts', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'LinkedIn-Version': '202401',
+        'X-Restli-Protocol-Version': '2.0.0',
+      },
+      body: JSON.stringify(postBody),
     });
-    if (!userRes.ok) {
-      throw new Error(`LinkedIn User Info Error (${userRes.status}): Could not resolve author URN.`);
+
+    if (!postRes.ok) {
+      const errText = await postRes.text();
+      throw new Error(`LinkedIn Publish Error for ${t.type} (${postRes.status}): ${errText}`);
     }
-    const userData = await userRes.json();
-    authorUrn = `urn:li:person:${userData.sub}`;
+
+    const postId = postRes.headers.get('x-restli-id') || 'published';
+    const feedUrl =
+      t.type === 'company'
+        ? 'https://www.linkedin.com/company/145405594/admin/dashboard/'
+        : 'https://www.linkedin.com/feed/';
+
+    results.push({
+      target: t.type,
+      author: t.urn,
+      id: postId,
+      url: feedUrl,
+    });
   }
 
-  const postBody = {
-    author: authorUrn,
-    commentary: text,
-    visibility: 'PUBLIC',
-    distribution: {
-      feedDistribution: 'MAIN_FEED',
-      targetEntities: [],
-      thirdPartyDistributionChannels: [],
-    },
-    lifecycleState: 'PUBLISHED',
-  };
-
-  const postRes = await fetch('https://api.linkedin.com/rest/posts', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      'LinkedIn-Version': '202401',
-      'X-Restli-Protocol-Version': '2.0.0',
-    },
-    body: JSON.stringify(postBody),
-  });
-
-  if (!postRes.ok) {
-    const errText = await postRes.text();
-    throw new Error(`LinkedIn Publish Error (${postRes.status}): ${errText}`);
-  }
-
-  const postId = postRes.headers.get('x-restli-id') || 'published';
   return {
     platform: 'linkedin',
     status: 'PUBLISHED',
-    id: postId,
-    url: 'https://www.linkedin.com/feed/',
+    count: results.length,
+    results,
   };
 }
 
 // ------------------------------------------------------------------------------
-// STATUS CHECK
+// SYSTEM HEALTH & STATUS CHECK
 // ------------------------------------------------------------------------------
 async function checkStatus() {
   console.log('\n================================================================');
-  console.log('       SOCIAL PUBLISHER — CONNECTED PLATFORMS STATUS');
+  console.log('       TILLERCAST — SOCIAL PUBLISHING CHANNELS STATUS');
   console.log('================================================================\n');
 
   const check = (name, hasKeys, notes) => {
@@ -313,19 +325,45 @@ async function checkStatus() {
   check('X / Twitter', hasTwitter, 'API v2 (500 posts/mo, $0 Free Tier)');
 
   const hasLinkedIn = Boolean(process.env.LINKEDIN_ACCESS_TOKEN);
-  check('LinkedIn', hasLinkedIn, 'REST API ($0 Free Developer Tier)');
+  let linkedInDetail = 'REST API ($0 Free Developer Tier)';
+  if (hasLinkedIn) {
+    const targets = [];
+    if (process.env.LINKEDIN_PERSON_URN) targets.push('Personal Profile');
+    if (process.env.LINKEDIN_ORGANIZATION_URN) targets.push('Tillercast Page (145405594)');
+    if (targets.length > 0) linkedInDetail += ` [Ready: ${targets.join(' & ')}]`;
+  }
+  check('LinkedIn', hasLinkedIn, linkedInDetail);
+
+  // Check Typefully
+  let hasTypefully = Boolean(process.env.TYPEFULLY_API_KEY);
+  if (!hasTypefully) {
+    const globalCfg = path.join(
+      process.env.USERPROFILE || process.env.HOME || '',
+      '.config',
+      'typefully',
+      'config.json'
+    );
+    if (fs.existsSync(globalCfg)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(globalCfg, 'utf8'));
+        if (parsed.apiKey || parsed.api_key) hasTypefully = true;
+      } catch {}
+    }
+  }
+  check('Typefully', hasTypefully, 'Secondary Skill (Connected: @RayyanMustafa18 & LinkedIn)');
 
   console.log('\n----------------------------------------------------------------');
-  console.log('Provide your credentials in .env to activate posting.\n');
+  console.log('Fill in missing credentials in .env to activate direct channels.\n');
 }
 
 // ------------------------------------------------------------------------------
-// CLI ARGUMENT PARSER
+// CLI DISPATCHER
 // ------------------------------------------------------------------------------
 function parseArgs() {
   const args = process.argv.slice(2);
   const options = {
     platforms: [],
+    target: 'personal', // personal, company, or both
     subreddit: null,
     title: null,
     text: null,
@@ -340,6 +378,8 @@ function parseArgs() {
       options.statusOnly = true;
     } else if (arg === '--dry-run') {
       options.dryRun = true;
+    } else if (arg === '--target') {
+      options.target = (args[++i] || 'personal').toLowerCase();
     } else if (arg === '--platform' || arg === '-p') {
       options.platforms = (args[++i] || '').split(',').map((p) => p.trim().toLowerCase());
     } else if (arg === '--subreddit' || arg === '-s') {
@@ -369,7 +409,7 @@ function parseArgs() {
 
 function printHelp() {
   console.log(`
-Usage: node social-publisher.js [options]
+Usage: node scripts/social-publisher.js [options]
 
 Options:
   --status                     Check configuration status of all social platforms
@@ -383,17 +423,20 @@ Options:
   --help, -h                   Show this help message
 
 Examples:
-  # Check connection status
-  node social-publisher.js --status
+  # Check which accounts are configured
+  node scripts/social-publisher.js --status
 
   # Post to Reddit r/SaaS
-  node social-publisher.js --platform reddit --subreddit SaaS --title "Launched my tool" --text "Story..."
+  node scripts/social-publisher.js --platform reddit --subreddit SaaS --title "Launched Tillercast" --text "Here is my story..."
 
   # Post a thread to X (Twitter)
-  node social-publisher.js --platform x --text "Tweet 1\\n---\\nTweet 2\\n---\\nTweet 3"
+  node scripts/social-publisher.js --platform x --text "Tweet 1\\n---\\nTweet 2\\n---\\nTweet 3"
 
   # Post to LinkedIn
-  node social-publisher.js --platform linkedin --text "Excited to share our milestone..."
+  node scripts/social-publisher.js --platform linkedin --text "Excited to share our milestone..."
+
+  # Cross-post to Reddit and X simultaneously
+  node scripts/social-publisher.js --platform reddit,x --subreddit SideProject --title "Built an AI tool" --text "Check this out..."
 `);
 }
 
@@ -427,19 +470,20 @@ async function main() {
           url: opts.url,
           dryRun: opts.dryRun,
         });
-        console.log(`  ✓ Reddit: ${res.status} -> ${res.url}`);
+        console.log(`  ✓ Reddit: ${res.status} -> ${res.url || JSON.stringify(res)}`);
       } else if (p === 'x' || p === 'twitter') {
         const res = await publishToTwitter({
           text: opts.text,
           dryRun: opts.dryRun,
         });
-        console.log(`  ✓ X (Twitter): ${res.status} -> ${res.url}`);
+        console.log(`  ✓ X (Twitter): ${res.status} -> ${res.url || JSON.stringify(res)}`);
       } else if (p === 'linkedin') {
         const res = await publishToLinkedIn({
           text: opts.text,
+          target: opts.target,
           dryRun: opts.dryRun,
         });
-        console.log(`  ✓ LinkedIn: ${res.status} -> ${res.url}`);
+        console.log(`  ✓ LinkedIn: ${res.status} -> ${res.url || JSON.stringify(res)}`);
       } else {
         console.warn(`  ! Unsupported platform: ${p}`);
       }
