@@ -1,0 +1,27 @@
+{
+  "name": "social-publisher",
+  "version": "1.0.0",
+  "description": "Autonomous multi-platform social publisher for Reddit, X (Twitter), and LinkedIn with zero middleware fees.",
+  "main": "social-publisher.js",
+  "bin": {
+    "social-publisher": "./social-publisher.js"
+  },
+  "scripts": {
+    "status": "node social-publisher.js --status",
+    "publish": "node social-publisher.js"
+  },
+  "keywords": [
+    "reddit-api",
+    "twitter-api",
+    "linkedin-api",
+    "social-media-automation",
+    "developer-tools",
+    "cross-posting"
+  ],
+  "author": "Rayyan Mustafa",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "twitter-api-v2": "^1.18.2"
+  }
+}
